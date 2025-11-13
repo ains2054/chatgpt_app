@@ -25,22 +25,36 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
     });
     String prompt = _promptController.text;
     _promptController.clear();
+    
+    final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
+    if (apiKey.isEmpty) {
+      setState(() {
+        inputEnabled = true;
+        responseTxt = "Error: API key not found. Please check your .env file.";
+      });
+      return;
+    }
+    
     try {
       final response = await dio.post(
-        'https://api.openai.com/v1/chat/completions',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
         options: Options(
-          sendTimeout: const Duration(seconds: 10),
-          receiveTimeout: const Duration(seconds: 10),
+          sendTimeout: const Duration(seconds: 30),
+          receiveTimeout: const Duration(seconds: 30),
           contentType: "application/json",
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${dotenv.env['token']}'
           },
         ),
         data: jsonEncode({
-          "model": "gpt-3.5-turbo",
-          "messages": [
-            {"role": "user", "content": prompt}
+          "contents": [
+            {
+              "parts": [
+                {
+                  "text": prompt
+                }
+              ]
+            }
           ],
         }),
       );
@@ -50,16 +64,22 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
         try {
           Map<String, dynamic>? responseJson = Map.from(response.data);
           _responseModel = ResponseModel.fromJson(responseJson);
-          responseTxt = _responseModel.choices?.content ?? "";
+          responseTxt = _responseModel.choices?.content ?? "No response received.";
           debugPrint(responseTxt);
         } catch (e) {
-          responseTxt = "Error parsing response.";
+          debugPrint("Error parsing response: $e");
+          responseTxt = "Error parsing response: $e";
         }
       });
     } catch (e) {
       setState(() {
         inputEnabled = true;
-        responseTxt = "Error: Unable to connect.";
+        debugPrint("API Error: $e");
+        if (e.toString().contains('401') || e.toString().contains('403')) {
+          responseTxt = "Error: Invalid API key. Please check your .env file.";
+        } else {
+          responseTxt = "Error: Unable to connect. ${e.toString()}";
+        }
       });
     }
   }
@@ -69,7 +89,7 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
     super.initState();
     Future.delayed(const Duration(milliseconds: 3), () {
       setState(() {
-        responseTxt = "Unsay naa sa imu hunahuna karon?";
+        responseTxt = "Pag ask na Kang Oblong";
       });
     });
   }
@@ -81,7 +101,7 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
       resizeToAvoidBottomInset: true,
       appBar: AppBar(
         title: const Text(
-          'Flutter and ChatGPT',
+          'Gemini Chat',
           style: TextStyle(color: Colors.white),
         ),
         backgroundColor: const Color(0xff343541),

@@ -1,21 +1,40 @@
 class Choices {
-  Choices({this.content, this.index, this.role, this.finish_reason});
+  Choices({this.content, this.role, this.finishReason});
   final String? content;
-  final int? index;
   final String? role;
-  final String? finish_reason;
+  final String? finishReason;
+  
   factory Choices.fromJson(Map<String, dynamic>? json) {
+    // Gemini API response structure
+    if (json == null) return Choices();
+    
+    // Extract text from parts array
+    String? text;
+    if (json['candidates'] != null && 
+        json['candidates'].isNotEmpty &&
+        json['candidates'][0]['content'] != null &&
+        json['candidates'][0]['content']['parts'] != null &&
+        json['candidates'][0]['content']['parts'].isNotEmpty) {
+      text = json['candidates'][0]['content']['parts'][0]['text'];
+    }
+    
+    String? finishReason;
+    if (json['candidates'] != null && 
+        json['candidates'].isNotEmpty &&
+        json['candidates'][0]['finishReason'] != null) {
+      finishReason = json['candidates'][0]['finishReason'];
+    }
+    
     return Choices(
-      content: json?['message']["content"].toString(),
-      index: json?['index'],
-      role: json?['message']['role'].toString(),
-      finish_reason: json?['finish_reason'].toString(),
+      content: text,
+      role: json['candidates']?[0]?['content']?['role'] ?? 'model',
+      finishReason: finishReason,
     );
   }
+  
   Map<String, dynamic>? toJson() => {
         "content": this.content,
-        "index": this.index,
         "role": this.role,
-        "finish_reason": this.finish_reason,
+        "finish_reason": this.finishReason,
       };
 }
