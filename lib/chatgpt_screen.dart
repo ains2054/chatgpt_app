@@ -495,7 +495,7 @@ class _LoadingIndicator extends StatelessWidget {
                 ),
                 SizedBox(width: 12),
                 Text(
-                  'Nag huna huna pa...',
+                  'Ga overthink Pa...',
                   style: TextStyle(
                     color: Colors.white70,
                     fontSize: 14,
