@@ -4,17 +4,106 @@ import 'package:chatgpt_app/models/response.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class ChatMessage {
   final String text;
   final bool isUser;
   final DateTime timestamp;
+  final String? docId; // For Firebase document reference
 
   ChatMessage({
     required this.text,
     required this.isUser,
     required this.timestamp,
+    this.docId,
   });
+
+  // Convert Firestore document to ChatMessage
+  factory ChatMessage.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    return ChatMessage(
+      text: data['text'] ?? '',
+      isUser: data['isUser'] ?? false,
+      timestamp: (data['timestamp'] as Timestamp).toDate(),
+      docId: doc.id,
+    );
+  }
+
+  // Convert ChatMessage to Firestore format
+  Map<String, dynamic> toFirestore() {
+    return {
+      'text': text,
+      'isUser': isUser,
+      'timestamp': Timestamp.fromDate(timestamp),
+      'createdAt': FieldValue.serverTimestamp(),
+    };
+  }
+}
+
+// Firebase Service
+class FirebaseService {
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+
+  // Save individual message
+  Future<void> saveChatMessage({
+    required String text,
+    required bool isUser,
+    required DateTime timestamp,
+  }) async {
+    try {
+      await _db.collection('chat_messages').add({
+        'text': text,
+        'isUser': isUser,
+        'timestamp': Timestamp.fromDate(timestamp),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('Error saving to Firebase: $e');
+      rethrow;
+    }
+  }
+
+  // Load chat history
+  Future<List<ChatMessage>> loadChatHistory() async {
+    try {
+      final snapshot = await _db
+          .collection('chat_messages')
+          .orderBy('timestamp', descending: false)
+          .get();
+
+      return snapshot.docs
+          .map((doc) => ChatMessage.fromFirestore(doc))
+          .toList();
+    } catch (e) {
+      debugPrint('Error loading chat history: $e');
+      return [];
+    }
+  }
+
+  // Stream chat history (real-time updates)
+  Stream<List<ChatMessage>> streamChatHistory() {
+    return _db
+        .collection('chat_messages')
+        .orderBy('timestamp', descending: false)
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => ChatMessage.fromFirestore(doc))
+            .toList());
+  }
+
+  // Clear all history
+  Future<void> clearHistory() async {
+    try {
+      final snapshot = await _db.collection('chat_messages').get();
+      for (var doc in snapshot.docs) {
+        await doc.reference.delete();
+      }
+    } catch (e) {
+      debugPrint('Error clearing history: $e');
+      rethrow;
+    }
+  }
 }
 
 class ChatgptScreen extends StatefulWidget {
@@ -27,41 +116,160 @@ class ChatgptScreen extends StatefulWidget {
 class _ChatgptScreenState extends State<ChatgptScreen> {
   final TextEditingController _promptController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final FirebaseService _firebaseService = FirebaseService();
   List<ChatMessage> messages = [];
   late ResponseModel _responseModel;
   bool inputEnabled = true;
   bool isLoading = false;
+  bool isLoadingHistory = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadChatHistory();
+  }
+
+  // Load chat history from Firebase
+  Future<void> _loadChatHistory() async {
+    setState(() {
+      isLoadingHistory = true;
+    });
+
+    try {
+      final history = await _firebaseService.loadChatHistory();
+      setState(() {
+        messages = history;
+        isLoadingHistory = false;
+      });
+
+      // Show welcome message if no history
+      if (messages.isEmpty) {
+        Future.delayed(const Duration(milliseconds: 300), () {
+          setState(() {
+            messages.add(ChatMessage(
+              text: "Pag ask na Kang Oblong",
+              isUser: false,
+              timestamp: DateTime.now(),
+            ));
+          });
+        });
+      }
+
+      _scrollToBottom();
+    } catch (e) {
+      debugPrint('Error loading history: $e');
+      setState(() {
+        isLoadingHistory = false;
+      });
+    }
+  }
+
+  // Clear chat history
+  Future<void> _clearHistory() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff2d2d2d),
+        title: const Text(
+          'Clear Chat History?',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: const Text(
+          'This will delete all messages from Firebase. This action cannot be undone.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      try {
+        await _firebaseService.clearHistory();
+        setState(() {
+          messages.clear();
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Chat history cleared'),
+            backgroundColor: Color(0xff667eea),
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error clearing history: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> completionFun() async {
     if (_promptController.text.trim().isEmpty) return;
     
     final dio = Dio();
     String prompt = _promptController.text.trim();
+    DateTime promptTimestamp = DateTime.now();
     
     // Add user message
+    final userMessage = ChatMessage(
+      text: prompt,
+      isUser: true,
+      timestamp: promptTimestamp,
+    );
+
     setState(() {
-      messages.add(ChatMessage(
-        text: prompt,
-        isUser: true,
-        timestamp: DateTime.now(),
-      ));
+      messages.add(userMessage);
       inputEnabled = false;
       isLoading = true;
     });
     
     _promptController.clear();
     _scrollToBottom();
+
+    // Save user message to Firebase
+    try {
+      await _firebaseService.saveChatMessage(
+        text: prompt,
+        isUser: true,
+        timestamp: promptTimestamp,
+      );
+      debugPrint('✅ User message saved to Firebase');
+    } catch (e) {
+      debugPrint('❌ Firebase save error: $e');
+    }
     
     final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
     if (apiKey.isEmpty) {
+      final errorMessage = ChatMessage(
+        text: "Error: API key not found. Please check your .env file.",
+        isUser: false,
+        timestamp: DateTime.now(),
+      );
+
       setState(() {
-        messages.add(ChatMessage(
-          text: "Error: API key not found. Please check your .env file.",
-          isUser: false,
-          timestamp: DateTime.now(),
-        ));
+        messages.add(errorMessage);
         inputEnabled = true;
         isLoading = false;
       });
+
+      await _firebaseService.saveChatMessage(
+        text: errorMessage.text,
+        isUser: false,
+        timestamp: errorMessage.timestamp,
+      );
+
       _scrollToBottom();
       return;
     }
@@ -99,19 +307,41 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
           Map<String, dynamic>? responseJson = Map.from(response.data);
           _responseModel = ResponseModel.fromJson(responseJson);
           String responseText = _responseModel.choices?.content ?? "No response received.";
-          messages.add(ChatMessage(
+          
+          final aiMessage = ChatMessage(
             text: responseText,
             isUser: false,
             timestamp: DateTime.now(),
-          ));
+          );
+
+          messages.add(aiMessage);
+          
+          // Save AI response to Firebase
+          _firebaseService.saveChatMessage(
+            text: responseText,
+            isUser: false,
+            timestamp: aiMessage.timestamp,
+          ).then((_) {
+            debugPrint('✅ AI response saved to Firebase');
+          }).catchError((error) {
+            debugPrint('❌ Firebase save error: $error');
+          });
+          
           debugPrint(responseText);
         } catch (e) {
           debugPrint("Error parsing response: $e");
-          messages.add(ChatMessage(
+          final errorMessage = ChatMessage(
             text: "Error parsing response: $e",
             isUser: false,
             timestamp: DateTime.now(),
-          ));
+          );
+          messages.add(errorMessage);
+
+          _firebaseService.saveChatMessage(
+            text: errorMessage.text,
+            isUser: false,
+            timestamp: errorMessage.timestamp,
+          );
         }
       });
       _scrollToBottom();
@@ -120,17 +350,26 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
         inputEnabled = true;
         isLoading = false;
         debugPrint("API Error: $e");
-        String errorMessage;
+        String errorText;
         if (e.toString().contains('401') || e.toString().contains('403')) {
-          errorMessage = "Error: Invalid API key. Please check your .env file.";
+          errorText = "Error: Invalid API key. Please check your .env file.";
         } else {
-          errorMessage = "Error: Unable to connect. ${e.toString()}";
+          errorText = "Error: Unable to connect. ${e.toString()}";
         }
-        messages.add(ChatMessage(
-          text: errorMessage,
+
+        final errorMessage = ChatMessage(
+          text: errorText,
           isUser: false,
           timestamp: DateTime.now(),
-        ));
+        );
+
+        messages.add(errorMessage);
+
+        _firebaseService.saveChatMessage(
+          text: errorMessage.text,
+          isUser: false,
+          timestamp: errorMessage.timestamp,
+        );
       });
       _scrollToBottom();
     }
@@ -145,20 +384,6 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
           curve: Curves.easeOut,
         );
       }
-    });
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(const Duration(milliseconds: 3), () {
-      setState(() {
-        messages.add(ChatMessage(
-          text: "Pag ask na Kang Oblong",
-          isUser: false,
-          timestamp: DateTime.now(),
-        ));
-      });
     });
   }
 
@@ -186,7 +411,7 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
         ),
         child: Column(
           children: [
-            // Custom AppBar
+            // Custom AppBar with Clear History button
             Container(
               decoration: BoxDecoration(
                 color: const Color(0xff2d2d2d).withOpacity(0.9),
@@ -226,14 +451,26 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
                         ),
                       ),
                       const SizedBox(width: 14),
-                      const Text(
-                        'Gemini Chat',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 24,
-                          fontWeight: FontWeight.w600,
-                          letterSpacing: 0.5,
+                      const Expanded(
+                        child: Text(
+                          'Gemini Chat',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
                         ),
+                      ),
+                      // Clear History Button
+                      IconButton(
+                        icon: const Icon(
+                          Icons.delete_outline,
+                          color: Colors.white70,
+                          size: 24,
+                        ),
+                        onPressed: messages.isEmpty ? null : _clearHistory,
+                        tooltip: 'Clear History',
                       ),
                     ],
                   ),
@@ -241,64 +478,83 @@ class _ChatgptScreenState extends State<ChatgptScreen> {
               ),
             ),
             Expanded(
-              child: messages.isEmpty
-                  ? Center(
+              child: isLoadingHistory
+                  ? const Center(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.all(30),
-                            decoration: BoxDecoration(
-                              gradient: const LinearGradient(
-                                colors: [Color(0xff667eea), Color(0xff764ba2)],
-                              ),
-                              shape: BoxShape.circle,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: const Color(0xff667eea).withOpacity(0.3),
-                                  blurRadius: 30,
-                                  spreadRadius: 5,
-                                ),
-                              ],
-                            ),
-                            child: const Icon(
-                              Icons.mood,
-                              size: 80,
-                              color: Colors.white,
-                            ),
+                          CircularProgressIndicator(
+                            valueColor: AlwaysStoppedAnimation<Color>(Color(0xff667eea)),
                           ),
-                          const SizedBox(height: 32),
-                          const Text(
-                            'Start a conversation',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w500,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
+                          SizedBox(height: 16),
                           Text(
-                            'Ask me anything!',
+                            'Loading history...',
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.6),
+                              color: Colors.white70,
                               fontSize: 16,
                             ),
                           ),
                         ],
                       ),
                     )
-                  : ListView.builder(
-                      controller: _scrollController,
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                      itemCount: messages.length + (isLoading ? 1 : 0),
-                      itemBuilder: (context, index) {
-                        if (index == messages.length) {
-                          return const _LoadingIndicator();
-                        }
-                        return _MessageBubble(message: messages[index]);
-                      },
-                    ),
+                  : messages.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(30),
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: [Color(0xff667eea), Color(0xff764ba2)],
+                                  ),
+                                  shape: BoxShape.circle,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: const Color(0xff667eea).withOpacity(0.3),
+                                      blurRadius: 30,
+                                      spreadRadius: 5,
+                                    ),
+                                  ],
+                                ),
+                                child: const Icon(
+                                  Icons.mood,
+                                  size: 80,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              const SizedBox(height: 32),
+                              const Text(
+                                'Start a conversation',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w500,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Ask me anything!',
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.6),
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : ListView.builder(
+                          controller: _scrollController,
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                          itemCount: messages.length + (isLoading ? 1 : 0),
+                          itemBuilder: (context, index) {
+                            if (index == messages.length) {
+                              return const _LoadingIndicator();
+                            }
+                            return _MessageBubble(message: messages[index]);
+                          },
+                        ),
             ),
             _InputField(
               promptController: _promptController,
@@ -382,7 +638,7 @@ class _MessageBubble extends StatelessWidget {
                 children: [
                   Text(
                     message.text,
-                    style: TextStyle(
+                    style: const TextStyle(
                       color: Colors.white,
                       fontSize: 16,
                       height: 1.5,
